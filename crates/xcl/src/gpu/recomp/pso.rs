@@ -214,7 +214,7 @@ mod translated {
         let Some(dir) = path.parent() else { return };
         let tmp = dir.join(format!("{}.{}.{:?}.tmp", path.file_name().unwrap_or_default().to_string_lossy(), std::process::id(), std::thread::current().id()));
         // written whole, then renamed: a reader never sees half a file
-        if std::fs::create_dir_all(dir).is_ok() && std::fs::write(&tmp, &b).is_ok() && std::fs::rename(&tmp, path).is_err() {
+        if super::super::cache_write::write(&tmp, &b).is_ok() && std::fs::rename(&tmp, path).is_err() {
             let _ = std::fs::remove_file(&tmp);
         }
     }

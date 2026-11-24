@@ -818,12 +818,10 @@ where
             src.len()
         ))
     })?;
-    if std::fs::create_dir_all(&dir).is_ok() {
-        // write to a temporary name first: another thread / process may be reading
-        let tmp = file.with_extension(format!("tmp{}", std::process::id()));
-        if std::fs::write(&tmp, &b).is_ok() && std::fs::rename(&tmp, &file).is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
+    // write to a temporary name first: another thread / process may be reading
+    let tmp = file.with_extension(format!("tmp{}", std::process::id()));
+    if super::cache_write::write(&tmp, &b).is_ok() && std::fs::rename(&tmp, &file).is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
     Ok((b, false))
 }
@@ -1082,6 +1080,54 @@ mod cache_tests {
         assert!(hit);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_publish_recovers_missing_and_deleted_parent_directories() {
+        let temp = std::env::temp_dir().canonicalize().unwrap();
+        let root = temp.join(format!("xcl-dxil-parent-recovery-{}", std::process::id()));
+        assert!(!root.exists());
+        for shape in ["dxil", "dxil/translated/v2/probe"] {
+            let dir = root.join(shape);
+            let file = dir.join(format!("{:016x}.dxil", cache_key("parent recovery", "main", "cs_6_6")));
+            for marker in [21, 22] {
+                let expected = synthetic_dxil(marker);
+                let (bytes, hit) = compile_cached_in_with(&dir, "parent recovery", "main", "cs_6_6", || Ok(expected.clone())).unwrap();
+                assert!(!hit);
+                assert_eq!(bytes, expected);
+                assert_eq!(std::fs::read(&file).unwrap(), expected);
+                let (bytes, hit) = compile_cached_in_with(&dir, "parent recovery", "main", "cs_6_6", || panic!("published entry was not cached")).unwrap();
+                assert!(hit);
+                assert_eq!(bytes, expected);
+                std::fs::remove_file(&file).unwrap();
+                std::fs::remove_dir(&dir).unwrap();
+            }
+        }
+        assert_eq!(root.canonicalize().unwrap().parent(), Some(temp.as_path()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cache_write_failure_keeps_compiled_output_and_a_replaced_parent() {
+        let temp = std::env::temp_dir().canonicalize().unwrap();
+        let root = temp.join(format!("xcl-dxil-file-parent-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let dir = root.join("cache");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+        std::fs::write(&dir, b"parent replaced by a file").unwrap();
+        let expected = synthetic_dxil(23);
+        let (bytes, hit) = compile_cached_in_with(&dir, "file parent", "main", "cs_6_6", || Ok(expected.clone())).unwrap();
+        assert!(!hit);
+        assert_eq!(bytes, expected, "publication remains best effort");
+        assert_eq!(std::fs::read(&dir).unwrap(), b"parent replaced by a file");
+        std::fs::remove_file(&dir).unwrap();
+        let (bytes, hit) = compile_cached_in_with(&dir, "file parent", "main", "cs_6_6", || Ok(expected.clone())).unwrap();
+        assert!(!hit);
+        assert_eq!(bytes, expected);
+        assert!(compile_cached_in_with(&dir, "file parent", "main", "cs_6_6", || panic!("repaired parent was not cached")).unwrap().1);
+        assert_eq!(root.canonicalize().unwrap().parent(), Some(temp.as_path()));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
