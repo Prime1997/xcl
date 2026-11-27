@@ -186,6 +186,9 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     if let Some(line) = crate::hle::kernelx::memory_owners::line() {
                         crate::xlog_info!("{line}");
                     }
+                    for l in crate::heap_count::lines(16).unwrap_or_default() {
+                        crate::xlog_info!("{l}");
+                    }
                 }
                 // past the budget Windows moves the process's video memory off the card and
                 // every frame pays for bringing it back; a run at the card's limit is also
