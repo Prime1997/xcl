@@ -82,11 +82,37 @@ fn log_open(api: &str, path: &str, flags: u32) {
     }
 }
 
-/// Whether `path` is the NVIDIA driver's shader cache file of a process
-/// (`…\NVIDIA\DXCache\<name>.nvph`, under `AppData\Local` or `AppData\LocalLow`).
+/// Whether `path` is the NVIDIA driver's shader cache file of a process: a `.nvph` file directly
+/// in `NVIDIA\DXCache` of this user's `AppData\Local` (`LOCALAPPDATA`) or of the `LocalLow`
+/// folder beside it, where the driver keeps them. A title's own file in folders of those names
+/// elsewhere is not one.
 fn is_driver_shader_cache(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    lower.ends_with(".nvph") && lower.contains(r"\nvidia\dxcache\")
+    static ROOTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let roots = ROOTS.get_or_init(|| driver_cache_roots(&std::env::var("LOCALAPPDATA").unwrap_or_default()));
+    is_driver_cache_in(path, roots)
+}
+
+/// The folders the driver keeps its shader cache files in for the user's `AppData\Local` folder
+/// `local`, in lowercase: `<local>\nvidia\dxcache\` and `<local>\..\locallow\nvidia\dxcache\`.
+fn driver_cache_roots(local: &str) -> Vec<String> {
+    let local = local.trim().replace('/', "\\").trim_end_matches('\\').to_ascii_lowercase();
+    if local.is_empty() {
+        return Vec::new();
+    }
+    let mut roots = vec![format!(r"{local}\nvidia\dxcache\")];
+    if let Some((parent, _)) = local.rsplit_once('\\') {
+        roots.push(format!(r"{parent}\locallow\nvidia\dxcache\"));
+    }
+    roots
+}
+
+/// Whether `path` (with or without `\\?\`) is a `.nvph` file directly in one of `roots`.
+fn is_driver_cache_in(path: &str, roots: &[String]) -> bool {
+    let lower = path.replace('/', "\\").to_ascii_lowercase();
+    let plain = lower.strip_prefix(r"\\?\").unwrap_or(&lower);
+    roots.iter().any(|root| {
+        plain.strip_prefix(root.as_str()).is_some_and(|name| name.len() > ".nvph".len() && name.ends_with(".nvph") && !name.contains('\\'))
+    })
 }
 
 /// `XCL_DRIVER_SHADER_CACHE=0`: the display driver's opens of its own shader cache file fail
@@ -1287,11 +1313,21 @@ mod tests {
 
     #[test]
     fn only_the_drivers_shader_cache_files_are_recognised() {
-        assert!(is_driver_shader_cache(r"C:\Users\a\AppData\Local\NVIDIA\DXCache\32e6a9dbc29925ed.nvph"));
-        assert!(is_driver_shader_cache(r"\\?\c:\users\a\appdata\locallow\nvidia\dxcache\0002A9DBC29925ED.NVPH"));
-        assert!(!is_driver_shader_cache(r"C:\Users\a\AppData\Local\NVIDIA\DXCache\"), "the folder itself");
-        assert!(!is_driver_shader_cache(r"C:\Games\Title\data\cache.nvph"), "a title's own file of that type");
-        assert!(!is_driver_shader_cache(r"C:\ProgramData\NVIDIA Corporation\Drs\nvdrssel.bin"), "the driver's settings");
+        let roots = driver_cache_roots(r"C:\Users\a\AppData\Local");
+        let is = |path: &str| is_driver_cache_in(path, &roots);
+        assert!(is(r"C:\Users\a\AppData\Local\NVIDIA\DXCache\32e6a9dbc29925ed.nvph"));
+        assert!(is(r"\\?\c:\users\a\appdata\locallow\nvidia\dxcache\0002A9DBC29925ED.NVPH"));
+        assert!(!is(r"C:\Users\a\AppData\Local\NVIDIA\DXCache\"), "the folder itself");
+        assert!(!is(r"C:\Games\Title\data\cache.nvph"), "a title's own file of that type");
+        assert!(!is(r"G:\assets\NVIDIA\DXCache\title.nvph"), "a title's path with the driver's folder names");
+        assert!(!is(r"C:\Users\a\AppData\Local\NVIDIA\DXCache\sub\title.nvph"), "not directly in the driver's folder");
+        assert!(!is(r"C:\Users\b\AppData\Local\NVIDIA\DXCache\32e6a9dbc29925ed.nvph"), "another user's");
+        assert!(!is(r"C:\ProgramData\NVIDIA Corporation\Drs\nvdrssel.bin"), "the driver's settings");
+        // this process's own folder, as the driver opens it
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            assert!(is_driver_shader_cache(&format!(r"{local}\NVIDIA\DXCache\32e6a9dbc29925ed.nvph")));
+            assert!(!is_driver_shader_cache(r"G:\assets\NVIDIA\DXCache\title.nvph"));
+        }
     }
 
     struct HookFixture {
