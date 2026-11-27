@@ -82,6 +82,33 @@ fn log_open(api: &str, path: &str, flags: u32) {
     }
 }
 
+/// Whether `path` is the NVIDIA driver's shader cache file of a process
+/// (`…\NVIDIA\DXCache\<name>.nvph`, under `AppData\Local` or `AppData\LocalLow`).
+fn is_driver_shader_cache(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".nvph") && lower.contains(r"\nvidia\dxcache\")
+}
+
+/// `XCL_DRIVER_SHADER_CACHE=0`: the display driver's opens of its own shader cache file fail
+/// (access denied), so it runs without one. The NVIDIA driver maps that file whole into the
+/// process and reads all of it at start: for a retail title whose file had grown to 4 GiB,
+/// 3.9 GB of the process's working set from the first second, on a machine whose memory the
+/// title fills. XCL keeps the driver's pipeline blobs in its own cache
+/// (`XCL_PSO_DISK_CACHE_MIN_MS`), so the driver's file holds them a second time.
+fn driver_cache_refused(path: &str) -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*OFF.get_or_init(|| std::env::var("XCL_DRIVER_SHADER_CACHE").is_ok_and(|v| v.trim() == "0")) || !is_driver_shader_cache(path) {
+        return false;
+    }
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 4 || n.is_power_of_two() {
+        crate::xlog_info!("VFS: the driver's shader cache file {path} is refused (XCL_DRIVER_SHADER_CACHE=0): #{n}");
+    }
+    unsafe { SetLastError(vfs::ERROR_ACCESS_DENIED) };
+    true
+}
+
 fn apply_open_decision(
     decision: Decision,
     disposition: u32,
@@ -111,6 +138,9 @@ unsafe extern "system" fn hk_create_file_w(n: *const u16, acc: u32, sh: u32, sa:
     let orig = orig!(O_CREATE_FILE_W as FnCreateFileW);
     let (Some(_g), Some(v)) = (Guard::enter(), vfs::get()) else { return orig(n, acc, sh, sa, disp, fl, t) };
     let Some(path) = from_wide_ptr(n) else { return orig(n, acc, sh, sa, disp, fl, t) };
+    if driver_cache_refused(&path) {
+        return INVALID_HANDLE_VALUE;
+    }
     log_open("CreateFileW", &path, fl);
     apply_open_decision(
         v.open_decision(&path, acc, disp, fl),
@@ -124,6 +154,9 @@ unsafe extern "system" fn hk_create_file_a(n: *const u8, acc: u32, sh: u32, sa: 
     let orig = orig!(O_CREATE_FILE_A as FnCreateFileA);
     let (Some(_g), Some(v)) = (Guard::enter(), vfs::get()) else { return orig(n, acc, sh, sa, disp, fl, t) };
     let Some(path) = from_ansi_ptr(n) else { return orig(n, acc, sh, sa, disp, fl, t) };
+    if driver_cache_refused(&path) {
+        return INVALID_HANDLE_VALUE;
+    }
     log_open("CreateFileA", &path, fl);
     apply_open_decision(
         v.open_decision(&path, acc, disp, fl),
@@ -139,6 +172,9 @@ unsafe extern "system" fn hk_create_file_2(n: *const u16, acc: u32, sh: u32, dis
     let Some(path) = from_wide_ptr(n) else { return orig(n, acc, sh, disp, params) };
     // CREATEFILE2_EXTENDED_PARAMETERS { dwSize, dwFileAttributes, dwFileFlags, ... }
     let flags = if params.is_null() { 0 } else { *((params as *const u8).add(8) as *const u32) };
+    if driver_cache_refused(&path) {
+        return INVALID_HANDLE_VALUE;
+    }
     log_open("CreateFile2", &path, flags);
     apply_open_decision(
         v.open_decision(&path, acc, disp, flags),
@@ -1248,6 +1284,15 @@ mod tests {
         CopyFile2, CopyFileExW, CopyFileW, CreateFileW, MoveFileExW, COPYFILE2_EXTENDED_PARAMETERS,
         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
     };
+
+    #[test]
+    fn only_the_drivers_shader_cache_files_are_recognised() {
+        assert!(is_driver_shader_cache(r"C:\Users\a\AppData\Local\NVIDIA\DXCache\32e6a9dbc29925ed.nvph"));
+        assert!(is_driver_shader_cache(r"\\?\c:\users\a\appdata\locallow\nvidia\dxcache\0002A9DBC29925ED.NVPH"));
+        assert!(!is_driver_shader_cache(r"C:\Users\a\AppData\Local\NVIDIA\DXCache\"), "the folder itself");
+        assert!(!is_driver_shader_cache(r"C:\Games\Title\data\cache.nvph"), "a title's own file of that type");
+        assert!(!is_driver_shader_cache(r"C:\ProgramData\NVIDIA Corporation\Drs\nvdrssel.bin"), "the driver's settings");
+    }
 
     struct HookFixture {
         dir: PathBuf,
