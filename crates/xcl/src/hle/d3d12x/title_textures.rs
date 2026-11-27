@@ -6957,6 +6957,22 @@ pub(super) mod tests {
             assert!(read_sub(&full, 0) == want[0].data, "mip 0 kept its texels");
             assert!(read_sub(&full, 1) == want[1].data, "a nonzero mip kept its texels");
             assert!(read_sub(&full, 9) == want[9].data, "the small level's neighbour kept its texels");
+            // `XCL_TEXTURE_DROP_LEVELS=1`: a texture placed then leaves its largest level without
+            // pages though it has texels, and does not count it as a level still to map
+            super::super::vram::DROP_FOR_TEST.store(1, Ordering::Relaxed);
+            let soft = place_tex(at);
+            let soft_key = soft.as_raw() as usize;
+            assert_eq!(super::super::vram::dropped_levels(soft_key), 1);
+            let got = map_levels_with_texels(&soft, &subresources(at, &tex));
+            assert!(!got.is_empty() && !got.contains(&0), "the smaller levels got pages, the largest none: {got:?}");
+            assert_eq!(super::super::vram::mapped_level_tiles(soft_key), Some((all - top_tiles) as u64));
+            assert!(!super::super::vram::has_unmapped_levels(soft_key), "a level left out is not one still to map");
+            // (a GPU write needs pages under all of it)
+            let write = capture_gpu_write(soft_key, ALL).unwrap();
+            publish_gpu_writes(WriterQueueId { raw: queue.as_raw() as usize, generation: 1 }, &[write]);
+            assert_eq!(super::super::vram::mapped_level_tiles(soft_key), Some(all as u64));
+            super::super::vram::DROP_FOR_TEST.store(0, Ordering::Relaxed);
+            drop(soft);
             super::super::vram::LEVEL_PAGES_FOR_TEST.store(false, Ordering::Relaxed);
             drop((small, full));
             VirtualFree(at as *mut c_void, 0, MEM_RELEASE);
