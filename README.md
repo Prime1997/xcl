@@ -411,6 +411,11 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
     local/system texture pools, sparse pools, uploads and both adapter budgets. These capacities
     overlap with process and GPU totals; driver/PSO and untracked allocations remain unattributed.
     Where the lines stop changing is where the title stopped.
+  - `XCL_HEAP_COUNT=2` with `XCL_ACTIVITY=1`: every 20 seconds, count XCL's live Rust heap
+    allocations by size and the title's `XMemAllocDefault` heap allocations, without stack
+    capture or Windows heap walks. These are only parts of process memory, not VRAM usage.
+    `XCL_HEAP_COUNT=1` also collects sampled allocation stacks and walks the process and shader
+    compiler heaps; those diagnostic operations can pause allocating threads.
   - `XCL_THREAD_DUMP_AT=s1,s2,…`: at each of those seconds after the start, the state of every
     thread of the title goes into `xcl.log`, for a title that stalls.
   - `XCL_TRACE_FAULTS=1` (any value): the first 32 access violations are logged as they are raised
