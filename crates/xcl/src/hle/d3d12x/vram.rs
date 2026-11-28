@@ -234,6 +234,8 @@ struct Target {
     used_extra: Vec<(usize, usize)>,
     /// its levels get their pages one by one (`map_levels`); None: all of it has pages
     levels: Option<Levels>,
+    /// GPU-owned placements share pages by physical identity, including explicit home mappings.
+    gpu_owned: bool,
 }
 
 /// The tiles of a texture whose levels get video memory when an upload first has texels for
@@ -874,28 +876,33 @@ impl Pages {
     }
 
     /// Acquire/share all `total` tiles for `res` at `va` and map them on the `Pages` queue.
-    unsafe fn bind(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
-        self.bind_range(dev, res, va, console_bytes, total, 0, 0..total as usize)
+    unsafe fn bind(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32, phys: &[Option<usize>]) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
+        self.bind_range(dev, res, va, console_bytes, total, 0, 0..total as usize, phys)
     }
 
     /// `bind` for the tiles `range` of the resource's `total`, which start at subresource `sub`.
     #[allow(clippy::too_many_arguments)]
-    unsafe fn bind_range(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32, sub: u32, range: std::ops::Range<usize>) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
-        self.bind_range_in(dev, res, va, console_bytes, total, sub, range, false)
+    unsafe fn bind_range(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32, sub: u32, range: std::ops::Range<usize>, phys: &[Option<usize>]) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
+        self.bind_range_in(dev, res, va, console_bytes, total, sub, range, false, phys)
     }
 
     /// `bind_range`, its new pages from the system-memory pools with `sys` (`texture_sysmem`).
     #[allow(clippy::too_many_arguments)]
-    unsafe fn bind_range_in(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32, sub: u32, range: std::ops::Range<usize>, sys: bool) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
+    unsafe fn bind_range_in(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32, sub: u32, range: std::ops::Range<usize>, sys: bool, phys: &[Option<usize>]) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
         let (first, own) = (total > 0).then(|| owned_pages(va, console_bytes, total as usize)).flatten()?;
         let now = std::time::Instant::now();
         self.sweep(now);
 
         let mut missing = 0usize;
         let mut preferred: Option<u32> = None;
+        let mut seen_owned = HashSet::new();
         for i in range.clone() {
             let existing = if i < own {
-                self.pages.get(&(first + i * PAGE)).map(|p| p.tile.0)
+                let key = page_key(first + i * PAGE, phys.get(i).copied().flatten());
+                // One physical page may also occur more than once within this placement.
+                // Reserve one tile per key; the binding loop counts each resource reference.
+                if !phys.is_empty() && !seen_owned.insert(key) { continue; }
+                self.pages.get(&key).map(|p| p.tile.0)
             } else {
                 self.extra_pages.get(&(va, i)).map(|p| p.tile.0)
             };
@@ -934,7 +941,7 @@ impl Pages {
         let mut used_extra = Vec::new();
         for i in range {
             let tile = if i < own {
-                let a = first + i * PAGE;
+                let a = page_key(first + i * PAGE, phys.get(i).copied().flatten());
                 let t = match self.pages.get_mut(&a) {
                     Some(p) => {
                         p.users += 1;
@@ -1057,6 +1064,38 @@ pub(super) fn canonical_va(va: usize) -> usize {
     if mapped { va } else { src }
 }
 
+/// Title virtual addresses never use bit 63; physical page numbers occupy a separate key space.
+const PHYS_KEY: usize = 1 << 63;
+
+/// GPU-owned aliases of a physical page share its backing even when their virtual addresses
+/// differ. Sampled textures and addresses without a physical mapping retain address keys.
+fn page_key(address: usize, physical: Option<usize>) -> usize {
+    physical.map_or(address, |page| PHYS_KEY | page)
+}
+
+/// Query kernel mappings before taking PAGES: kernelx's mapping lock must not nest inside it.
+fn physical_pages_under(va: usize, console_bytes: Option<u64>, gpu_owned: bool) -> Vec<Option<usize>> {
+    if !gpu_owned { return Vec::new(); }
+    match console_bytes.and_then(|b| owned_pages(va, Some(b), usize::MAX)) {
+        Some((first, n)) if n > 0 => crate::hle::kernelx::physical_pages(first, n),
+        _ => Vec::new(),
+    }
+}
+
+/// Address-keyed backing would allocate once per distinct address, even when physical identity
+/// is the same. Count that difference for live GPU-owned targets without counting same-VA views.
+fn physical_alias_pages<'a>(targets: impl Iterator<Item = &'a Target>) -> usize {
+    let (mut physical, mut addresses) = (HashSet::new(), HashSet::new());
+    for t in targets.filter(|t| t.gpu_owned && t.mapped) {
+        let Some((first, _)) = owned_pages(t.va, t.console_bytes, t.total as usize) else { continue };
+        for (i, &key) in t.used.iter().enumerate().filter(|(_, key)| **key & PHYS_KEY != 0) {
+            physical.insert(key);
+            addresses.insert((key, first + i * PAGE));
+        }
+    }
+    addresses.len().saturating_sub(physical.len())
+}
+
 /// A texture at `va` as a reserved resource on the title's shared 64 KiB pages
 /// (`console_bytes`: its size on the console; tiles past the owned page boundaries are shared by
 /// `(va, tile_index)` so repeated placements at the same address do not leak). None: it cannot be.
@@ -1081,6 +1120,7 @@ unsafe fn place_on_pages(
     if (require_aligned || console_bytes.is_none()) && va % PAGE != 0 {
         return None;
     }
+    let phys = physical_pages_under(va, console_bytes, require_aligned);
     // reserved textures have the PC's 64 KiB tiles
     let tiled = D3D12_RESOURCE_DESC { Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE, ..*desc };
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -1124,10 +1164,10 @@ unsafe fn place_on_pages(
                 // nothing mapped yet: a level gets its pages with its first texels (`map_levels`)
                 LEVEL_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 LEVEL_STATS[1].fetch_add(total as u64, std::sync::atomic::Ordering::Relaxed);
-                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used: Vec::new(), used_extra: Vec::new(), levels });
+                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used: Vec::new(), used_extra: Vec::new(), levels, gpu_owned: require_aligned });
                 true
-            } else if let Some((used, used_extra)) = pages.bind(dev, res, va, console_bytes, total) {
-                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra, levels: None });
+            } else if let Some((used, used_extra)) = pages.bind(dev, res, va, console_bytes, total, &phys) {
+                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra, levels: None, gpu_owned: require_aligned });
                 true
             } else {
                 false
@@ -1195,20 +1235,25 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
     }
     let Some(dev) = dev else { return false };
     let key = res.as_raw() as usize;
-    let mut g = PAGES.lock().unwrap();
-    let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return false };
-    let Some((va, console_bytes, total, mapped)) = pages.targets.get(&key).map(|t| (t.va, t.console_bytes, t.total, t.mapped)) else {
-        return false;
+    let target = |g: &mut std::sync::MutexGuard<'_, std::collections::BTreeMap<usize, Option<Pages>>>| {
+        let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return None };
+        pages.targets.get(&key).map(|t| (t.va, t.console_bytes, t.total, t.mapped, t.gpu_owned))
     };
+    let Some((va, console_bytes, _, mapped, gpu_owned)) = target(&mut PAGES.lock().unwrap()) else { return false };
+    if mapped { return true; }
+    let phys = physical_pages_under(va, console_bytes, gpu_owned);
+    let mut g = PAGES.lock().unwrap();
+    let Some((va, console_bytes, total, mapped, _)) = target(&mut g) else { return false };
     if mapped {
         return true;
     }
+    let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return false };
     // (lazy levels: they get their pages again with their next texels)
     if let Some(t) = pages.targets.get_mut(&key).filter(|t| t.levels.is_some()) {
         t.mapped = true;
         return true;
     }
-    let Some((used, used_extra)) = pages.bind(&dev, res, va, console_bytes, total) else {
+    let Some((used, used_extra)) = pages.bind(&dev, res, va, console_bytes, total, &phys) else {
         return false;
     };
     if let Some(t) = pages.targets.get_mut(&key) {
@@ -1399,6 +1444,15 @@ pub(super) fn page_bytes_for(device: usize) -> (usize, usize) {
     ((p.pages.len() + p.extra_pages.len()) * PAGE, (p.pools.len() + p.sys_pools.len()) * POOL_PAGES as usize * PAGE)
 }
 
+/// Tiles neither free, cooling, nor owned by a page (an allocation-accounting defect).
+#[cfg(test)]
+pub(super) fn tiles_unaccounted_for(device: usize) -> usize {
+    let g = PAGES.lock().unwrap();
+    let Some(Some(p)) = g.get(&device) else { return 0 };
+    ((p.pools.len() + p.sys_pools.len()) * POOL_PAGES as usize).saturating_sub(
+        p.pool.free_total + p.sys_pool.free_total + p.pool.cooling.len() + p.sys_pool.cooling.len() + p.pages.len() + p.extra_pages.len())
+}
+
 /// Pool/tile identities used by one mapped resource: title pages, then extra pages.
 /// Unlike device-wide byte counts, these cannot shrink when unrelated idle targets expire.
 #[cfg(test)]
@@ -1422,11 +1476,13 @@ pub fn page_owners() -> String {
     let mut kinds = [(0usize, 0usize); 2];
     let (mut pages, mut idle) = (0usize, 0usize);
     let (mut local_pools, mut system_pools) = (0usize, 0usize);
+    let mut aliases = 0usize;
     for p in g.values().flatten() {
         pages += p.pages.len() + p.extra_pages.len();
         idle += p.idle.len();
         local_pools += p.pools.len();
         system_pools += p.sys_pools.len();
+        aliases += physical_alias_pages(p.targets.values());
         for t in p.targets.values() {
             let k = if t.levels.is_none() { 0 } else { 1 };
             kinds[k].0 += 1;
@@ -1435,8 +1491,8 @@ pub fn page_owners() -> String {
     }
     let mb = |n: usize| n * PAGE >> 20;
     format!(
-        "target pages by owner: {} textures with all their pages hold {} MB, {} sampled textures with pages by level hold {} MB (a shared page counts for each); {} MB of pages in all, {} MB of them idle; pool capacity {} MB local, {} MB system",
-        kinds[0].0, mb(kinds[0].1), kinds[1].0, mb(kinds[1].1), mb(pages), mb(idle), mb(local_pools * POOL_PAGES as usize), mb(system_pools * POOL_PAGES as usize)
+        "target pages by owner: {} textures with all their pages hold {} MB, {} sampled textures with pages by level hold {} MB (a shared page counts for each); {} MB of pages in all, {} MB of them idle; pool capacity {} MB local, {} MB system; physical aliases avoid {} MB of duplicate address backing",
+        kinds[0].0, mb(kinds[0].1), kinds[1].0, mb(kinds[1].1), mb(pages), mb(idle), mb(local_pools * POOL_PAGES as usize), mb(system_pools * POOL_PAGES as usize), mb(aliases)
     )
 }
 
@@ -1445,6 +1501,21 @@ pub fn page_bytes() -> (usize, usize) {
     g.values().flatten().fold((0, 0), |(used, pools), p| {
         (used + (p.pages.len() + p.extra_pages.len()) * PAGE, pools + (p.pools.len() + p.sys_pools.len()) * POOL_PAGES as usize * PAGE)
     })
+}
+
+/// Unique page bytes and active pool capacity, separately for local and system backing.
+/// Retired heap holds and driver allocations are outside these counters.
+pub fn page_bytes_by_memory() -> ((usize, usize), (usize, usize)) {
+    let g = PAGES.lock().unwrap();
+    let (mut local, mut system) = ((0, 0), (0, 0));
+    for p in g.values().flatten() {
+        local.1 += p.pools.len() * POOL_PAGES as usize * PAGE;
+        system.1 += p.sys_pools.len() * POOL_PAGES as usize * PAGE;
+        for page in p.pages.values().chain(p.extra_pages.values()) {
+            if tile_is_sys(page.tile) { system.0 += PAGE; } else { local.0 += PAGE; }
+        }
+    }
+    (local, system)
 }
 
 /// Heaps of every kind of resource in one (resource heap tier 2) – else no arenas.
@@ -1512,7 +1583,7 @@ pub(super) unsafe fn map_levels(res: &ID3D12Resource, levels: Option<&[u32]>) ->
         let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { return Vec::new() };
         let mut fresh = Vec::new();
         for (k, sub, first, n, levels) in todo {
-            let Some((used, used_extra)) = pages.bind_range_in(dev, res, va, console_bytes, total, sub, first as usize..(first + n) as usize, texture_sysmem()) else { continue };
+            let Some((used, used_extra)) = pages.bind_range_in(dev, res, va, console_bytes, total, sub, first as usize..(first + n) as usize, texture_sysmem(), &[]) else { continue };
             let Some(t) = pages.targets.get_mut(&key) else { return fresh };
             t.used.extend(used);
             t.used_extra.extend(used_extra);
@@ -1736,6 +1807,27 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const MIB: usize = 1 << 20;
+
+    #[test]
+    fn physical_alias_count_excludes_same_address_views_and_sampled_textures() {
+        let make = |va, keys: Vec<usize>, gpu_owned| Target {
+            va, console_bytes: Some((keys.len() * PAGE) as u64), total: keys.len() as u32,
+            mapped: true, used: keys, used_extra: Vec::new(), levels: None, gpu_owned,
+        };
+        let p = page_key(0x10000, Some(16));
+        assert_eq!(p, page_key(0x20000, Some(16)));
+        assert_ne!(p, page_key(0x10000, None));
+        assert_ne!(p, page_key(0x10000, Some(32)));
+        let mut targets = vec![make(0x10000, vec![p], true), make(0x10000, vec![p], true)];
+        assert_eq!(physical_alias_pages(targets.iter()), 0, "same-address views already shared");
+        targets.push(make(0x20000, vec![p], true));
+        assert_eq!(physical_alias_pages(targets.iter()), 1);
+        targets.push(make(0x30000, vec![p], false));
+        targets.push(make(0x40000, vec![page_key(0x40000, None)], true));
+        assert_eq!(physical_alias_pages(targets.iter()), 1, "sampled/address-keyed pages are excluded");
+        targets[2].mapped = false;
+        assert_eq!(physical_alias_pages(targets.iter()), 0, "unmapped placements hold no alias backing");
+    }
 
     /// `remove_once_each` takes one occurrence for each time an item is named, keeps the rest
     /// (duplicates too) and items not named, and leaves the list as it was for nothing to take.

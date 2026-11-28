@@ -356,6 +356,11 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
   memory use and slower sampling; it does not reduce total texture memory or enforce a budget.
   Empty cooled heaps in both pools follow the same GPU retirement checks. Activity logs count
   both kinds in pool capacity and report their local/system split. Off by default.
+- GPU-owned textures placed over aliases of one title physical page share one GPU page,
+  including explicitly mapped home addresses. Sampled texture levels retain their existing
+  address-based sharing. This removes duplicate backing for those aliases; it is not a global
+  memory cap, and resource synchronization remains required when aliases are used. Activity
+  logs count the duplicate address backing avoided, excluding multiple views at the same address.
 - Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime
   classes asked for, shader statistics, audio formats, crash).
   `d3d12.presents` counts presentations, not visible content. With `XCL_FRAME_DUMP=N` (`N > 1`),
