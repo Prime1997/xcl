@@ -357,6 +357,8 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
   before placement returns, adapting the NVIDIA workaround in #3116. Failed signalling,
   device removal or a five-second wait deadline fails placement instead of publishing an
   unfinished texture. Uncertain mapping resources remain held until completion is proven.
+- Deferred resource releases keep their objects held after device removal; the fence's
+  removal sentinel does not count as completed GPU work.
 - `XCL_TEXTURE_SYSMEM=1`, together with `XCL_TEXTURE_LEVEL_PAGES=1`, optionally backs newly
   loaded sampled texture levels with system-memory heaps. Existing shared pages keep their
   backing; render targets and other allocations keep the normal placement path. Failed
