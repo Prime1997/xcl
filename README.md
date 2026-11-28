@@ -294,6 +294,9 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
     default.
 - Retired two-pass mesh buffers from tracked command lists can be reused once all GPU
   submissions that used them complete, even while the title still holds the command allocator.
+- Reclaimed texture pool and arena heaps remain held if any queue's retirement fence cannot
+  be created or signaled. A device-removal fence value is not treated as completed GPU work;
+  these failed retirements stay held until process exit.
 - Direct two-pass mesh draws can reuse one smaller record buffer across several slices when
   the memory cap is tight. Each slice keeps the draw's original mesh group IDs.
 - Two-pass indirect mesh draws also accept standalone upload-heap argument and count buffers

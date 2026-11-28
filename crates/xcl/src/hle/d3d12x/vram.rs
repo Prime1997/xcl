@@ -1148,7 +1148,7 @@ fn forget_pages(resource: usize) {
 }
 
 /// Reclaimed heaps waiting for `unmap_mark` (if any) and every live queue's fence mark on one device.
-struct RetiringBatch<H, F> { heaps: Vec<H>, unmap_mark: Option<(F, u64)>, marks: Vec<(F, u64)> }
+struct RetiringBatch<H, F> { heaps: Vec<H>, unmap_mark: Option<(F, u64)>, marks: Vec<(F, u64)>, armed: bool }
 
 /// Per-device multi-queue retirement state (`H` = heap, `F` = fence; pure-CPU types in tests).
 struct RetireQueue<H, F> { fences: std::collections::HashMap<usize, (F, u64)>, batches: Vec<RetiringBatch<H, F>> }
@@ -1157,30 +1157,36 @@ impl<H, F: Clone> RetireQueue<H, F> {
     fn new() -> Self { Self { fences: std::collections::HashMap::new(), batches: Vec::new() } }
 
     /// Seal `heaps` behind `unmap_mark` and one fence signal per queue (signaled BEFORE queueing).
-    /// Returns `heaps` immediately when zero marks were signaled and `unmap_mark` is `None`.
+    /// Returns `heaps` immediately only when there are no queues and no `unmap_mark`.
+    /// A failed fence creation or signal retains the batch; later marks cannot prove that
+    /// the unmarked queue stopped using its heaps.
     fn retire_with<Q>(&mut self, heaps: Vec<H>, unmap_mark: Option<(F, u64)>, queues: &[(usize, Q)], mut make_fence: impl FnMut() -> Option<F>, mut signal: impl FnMut(&Q, &F, u64) -> bool) -> Vec<H> {
         if heaps.is_empty() { return Vec::new(); }
         let mut marks = Vec::with_capacity(queues.len());
+        let mut armed = true;
         for (k, q) in queues {
             let (f, v) = match self.fences.entry(*k) {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                std::collections::hash_map::Entry::Vacant(e) => { let Some(f) = make_fence() else { continue }; e.insert((f, 0)) }
+                std::collections::hash_map::Entry::Vacant(e) => { let Some(f) = make_fence() else { armed = false; continue }; e.insert((f, 0)) }
             };
-            if signal(q, f, *v + 1) { *v += 1; marks.push((f.clone(), *v)); }
+            let Some(next) = v.checked_add(1).filter(|&n| n != u64::MAX) else { armed = false; continue };
+            if signal(q, f, next) { *v = next; marks.push((f.clone(), *v)); } else { armed = false; }
         }
-        if marks.is_empty() && unmap_mark.is_none() { return heaps; }
-        self.batches.push(RetiringBatch { heaps, unmap_mark, marks });
+        if queues.is_empty() && unmap_mark.is_none() { return heaps; }
+        self.batches.push(RetiringBatch { heaps, unmap_mark, marks, armed });
         Vec::new()
     }
 
     /// Reap completed batches and prune dead-queue fences once completed; caller drops outside locks.
     fn sweep_with(&mut self, live_queues: &HashSet<usize>, mut completed: impl FnMut(&F) -> u64) -> (Vec<RetiringBatch<H, F>>, Vec<F>) {
+        // D3D12 reports device removal as UINT64_MAX, not successful completion.
+        let mut reached = |f: &F, value: u64| { let done = completed(f); done != u64::MAX && done >= value };
         let (mut done, mut kept) = (Vec::new(), Vec::new());
         for b in std::mem::take(&mut self.batches) {
-            if b.unmap_mark.as_ref().is_none_or(|(f, v)| completed(f) >= *v) && b.marks.iter().all(|(f, v)| completed(f) >= *v) { done.push(b); } else { kept.push(b); }
+            if b.armed && b.unmap_mark.as_ref().is_none_or(|(f, v)| reached(f, *v)) && b.marks.iter().all(|(f, v)| reached(f, *v)) { done.push(b); } else { kept.push(b); }
         }
         self.batches = kept;
-        let stale: Vec<usize> = self.fences.iter().filter(|(k, (f, v))| !live_queues.contains(k) && completed(f) >= *v).map(|(&k, _)| k).collect();
+        let stale: Vec<usize> = self.fences.iter().filter(|(k, (f, v))| !live_queues.contains(k) && reached(f, *v)).map(|(&k, _)| k).collect();
         let pruned = stale.into_iter().filter_map(|k| self.fences.remove(&k).map(|(f, _)| f)).collect();
         (done, pruned)
     }
@@ -1976,6 +1982,50 @@ mod tests {
         assert_eq!((done[0].heaps.as_slice(), pruned.len(), rq.batches.is_empty()), (&[202][..], 1, true));
         assert!(Arc::ptr_eq(&pruned[0], &qf[&4]));
         assert_eq!(rq.retire_with(vec![303], None, &[] as &[(usize, usize)], mk, |_, _, _| true), vec![303]);
+    }
+
+    #[test]
+    fn retire_queue_keeps_heaps_when_a_queue_cannot_be_marked() {
+        for signal_fails in [false, true] {
+            let mut rq = RetireQueue::<u32, usize>::new();
+            let mut made = 0;
+            assert!(rq.retire_with(vec![101], None, &[(1, 1usize), (2, 2)], || {
+                made += 1;
+                (signal_fails || made != 2).then_some(made)
+            }, |q, _, _| !signal_fails || *q != 2).is_empty());
+            let (done, _) = rq.sweep_with(&HashSet::new(), |_| u64::MAX - 1);
+            assert!(done.is_empty(), "the successful queue cannot stand in for an unmarked queue");
+            assert_eq!(rq.batches[0].heaps, vec![101]);
+            assert!(!rq.batches[0].armed);
+        }
+        let mut rq = RetireQueue::<u32, usize>::new();
+        assert!(rq.retire_with(vec![202], None, &[(1, ())], || None, |_, _, _| unreachable!()).is_empty(), "no fence is not the same as no queues");
+        assert_eq!(rq.batches[0].heaps, vec![202]);
+    }
+
+    #[test]
+    fn retire_queue_rejects_removed_device_completion_for_unmap_and_queue_fences() {
+        for removed in [0usize, 1] {
+            let mut rq = RetireQueue::<u32, usize>::new();
+            assert!(rq.retire_with(vec![101], Some((0, 1)), &[(1, ())], || Some(1), |_, _, _| true).is_empty());
+            let (done, pruned) = rq.sweep_with(&HashSet::new(), |f| if *f == removed { u64::MAX } else { 1 });
+            assert!(done.is_empty(), "device removal does not retire heaps");
+            assert_eq!(rq.batches.len(), 1);
+            if removed == 1 { assert!(pruned.is_empty(), "device removal does not prune a queue fence"); }
+            let (done, _) = rq.sweep_with(&HashSet::new(), |_| 1);
+            assert_eq!(done[0].heaps, vec![101]);
+        }
+    }
+
+    #[test]
+    fn retire_queue_does_not_signal_the_removal_sentinel_or_wrap_a_fence() {
+        for value in [u64::MAX - 1, u64::MAX] {
+            let mut rq = RetireQueue::<u32, ()>::new();
+            rq.fences.insert(1, ((), value));
+            assert!(rq.retire_with(vec![101], None, &[(1, ())], || unreachable!(), |_, _, _| panic!("invalid fence value signaled")).is_empty());
+            assert!(!rq.batches[0].armed);
+            assert!(rq.sweep_with(&HashSet::new(), |_| u64::MAX).0.is_empty());
+        }
     }
 
     #[test]
