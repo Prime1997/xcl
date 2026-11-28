@@ -31,6 +31,9 @@ pub(super) enum Write {
 
 struct Job {
     fence: ID3D12Fence,
+    // Capture the diagnostic number while the queue is alive; the worker never looks it up
+    // through a queue address that may have been released or reused.
+    queue_id: usize,
     value: u64,
     writes: Vec<Write>,
     queued: Instant,
@@ -128,7 +131,7 @@ fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
                     if state != ProducerStatus::Complete && !job.warned
                         && (state == ProducerStatus::Removed || job.queued.elapsed() >= Duration::from_secs(10)) {
                         job.warned = true;
-                        crate::xlog_warn!("D3D12.X: holding {} CPU writes after {} ms: producer {:?}, fence at {}, wanted {}", job.writes.len(), job.queued.elapsed().as_millis(), state, done, job.value);
+                        crate::xlog_warn!("D3D12.X: holding {} CPU writes after {} ms: producer {:?}, fence at {}, wanted {} (queue q{}, producer fence {:#x}, Signal accepted)", job.writes.len(), job.queued.elapsed().as_millis(), state, done, job.value, job.queue_id, job.fence.as_raw() as usize);
                     }
                     state
                 }, |job| {
@@ -278,6 +281,7 @@ pub(super) unsafe fn after(queue: *mut c_void, writes: Vec<Write>) {
         return;
     }
     let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return };
+    let queue_id = super::list_x::queue_id(queue as usize);
     let sender = worker();
     let count = writes.len();
     let sent = {
@@ -302,12 +306,12 @@ pub(super) unsafe fn after(queue: *mut c_void, writes: Vec<Write>) {
         });
         let Some(writes) = keep_if_marked(writes, marked) else {
             if !entry.failed {
-                crate::xlog_error!("D3D12.X: cannot signal CPU-write producer; retaining in-flight resources without publishing");
+                crate::xlog_error!("D3D12.X: cannot signal CPU-write producer on q{queue_id} (fence {:#x}, last mark {}); retaining in-flight resources without publishing", entry.fence.as_raw() as usize, entry.value);
             }
             entry.failed = true;
             return;
         };
-        let job = Job { fence: entry.fence.clone(), value: entry.value, writes, queued: Instant::now(), warned: false };
+        let job = Job { fence: entry.fence.clone(), queue_id, value: entry.value, writes, queued: Instant::now(), warned: false };
         // Enqueue under the signal-order lock: concurrent submitters must not publish value N+1
         // before the worker has received N. The unbounded send does not wait for GPU/title work.
         send_or_retain(&sender.lock().unwrap(), job)
@@ -315,7 +319,7 @@ pub(super) unsafe fn after(queue: *mut c_void, writes: Vec<Write>) {
     static FIRST: std::sync::Once = std::sync::Once::new();
     FIRST.call_once(|| crate::xlog_info!("D3D12.X: bottom-of-pipe writes outside unified memory are done by the CPU after the GPU ({} in the first submission)", count));
     if !sent {
-        crate::xlog_error!("D3D12.X: CPU-write worker unavailable; retaining in-flight resources without publishing");
+        crate::xlog_error!("D3D12.X: CPU-write worker unavailable for q{queue_id}; retaining in-flight resources without publishing");
     }
 }
 
