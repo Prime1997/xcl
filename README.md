@@ -348,6 +348,13 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
   fills into its GPU views) are applied: a GPU-view page shows the physical page mapped into it.
   `XCL_PAGE_MAPPINGS=0` turns them off (the call is ignored and a GPU-view page shows its CPU view at
   the same offset, as before).
+- `XCL_TEXTURE_SYSMEM=1`, together with `XCL_TEXTURE_LEVEL_PAGES=1`, optionally backs newly
+  loaded sampled texture levels with system-memory heaps. Existing shared pages keep their
+  backing; render targets and other allocations keep the normal placement path. Failed
+  system-heap allocation falls back to local heaps. This can trade VRAM pressure for system
+  memory use and slower sampling; it does not reduce total texture memory or enforce a budget.
+  Empty cooled heaps in both pools follow the same GPU retirement checks. Activity logs count
+  both kinds in pool capacity and report their local/system split. Off by default.
 - Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime
   classes asked for, shader statistics, audio formats, crash).
   `d3d12.presents` counts presentations, not visible content. With `XCL_FRAME_DUMP=N` (`N > 1`),
