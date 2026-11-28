@@ -436,6 +436,8 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
   Tracked, completed and pending receipt counts are reported separately, along with exact-marker
   failures, receipts discarded on tracker contention and pending receipts evicted at the capacity
   bound. They are the correlation foundation for GPU timestamp durations, not GPU timing samples.
+- Driver-call timing slots are returned when their threads exit, so short-lived threads do not
+  permanently exhaust the 64-thread limit for stall diagnostics.
 - **Diagnostics for a bug report** (all off by default; set them in the environment of `xcl run`):
   - `XCL_RUN_SECONDS=n`: the title ends itself after `n` seconds, with the GPU drained and
     `xcl.log` and `report.json` written, so a run of a fixed length can be attached. A value that
