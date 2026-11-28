@@ -346,7 +346,7 @@ fn rd64(d: &[u8], o: usize) -> u64 {
 
 type BaseShaderIndex = Mutex<Option<HashMap<(u64, usize), std::sync::Weak<Vec<u8>>>>>;
 
-/// A weak index shares live Base shader copies, without keeping their byte buffers alive.
+/// A weak index shares live shader copies, without keeping their byte buffers alive.
 /// Unlike Arc<[u8]>, the Vec payload is released at the last strong reference, even while
 /// this index keeps a weak reference. The index itself is bounded too.
 fn share_base_shader(index: &BaseShaderIndex, hash: u64, bytes: &[u8], limit: usize) -> Arc<Vec<u8>> {
@@ -371,10 +371,15 @@ fn share_base_shader(index: &BaseShaderIndex, hash: u64, bytes: &[u8], limit: us
     owned
 }
 
-/// Own each stage's bytes and point the descriptor at them; None when one is not readable.
-unsafe fn own_base_shaders(d: &mut [u8; GFX_DESC]) -> Option<[Option<Arc<Vec<u8>>>; 5]> {
+/// Share immutable shader storage between retained bases and asynchronous pipeline recipes.
+pub(super) fn shared_shader_bytes(bytes: &[u8]) -> Arc<Vec<u8>> {
     static INDEX: BaseShaderIndex = Mutex::new(None);
     const INDEX_LIMIT: usize = 65_536;
+    share_base_shader(&INDEX, crate::gpu::shader::fnv64(bytes), bytes, INDEX_LIMIT)
+}
+
+/// Own each stage's bytes and point the descriptor at them; None when one is not readable.
+unsafe fn own_base_shaders(d: &mut [u8; GFX_DESC]) -> Option<[Option<Arc<Vec<u8>>>; 5]> {
     let mut shaders = std::array::from_fn(|_| None);
     for (k, &o) in STAGES.iter().enumerate() {
         let (p, n) = (rd64(d, o) as usize, rd64(d, o + 8) as usize);
@@ -383,7 +388,7 @@ unsafe fn own_base_shaders(d: &mut [u8; GFX_DESC]) -> Option<[Option<Arc<Vec<u8>
                 return None;
             }
             let bytes = std::slice::from_raw_parts(p as *const u8, n);
-            shaders[k] = Some(share_base_shader(&INDEX, crate::gpu::shader::fnv64(bytes), bytes, INDEX_LIMIT));
+            shaders[k] = Some(shared_shader_bytes(bytes));
         }
         let at = shaders[k].as_ref().map_or(0, |v| v.as_ptr() as u64);
         d[o..o + 8].copy_from_slice(&at.to_le_bytes());
