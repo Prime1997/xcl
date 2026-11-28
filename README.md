@@ -353,6 +353,10 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
   queries run outside mapping locks and stop at 100 ms or 16,384 regions. Concurrent snapshots
   are not process-private, working-set or VRAM totals and exclude old away bytes retained after free.
 - Releasing physical pages returns unused per-page home backing immediately; live sibling pages remain allocated, including after repeated frees.
+- New lazy textures (`XCL_TEXTURE_LEVEL_PAGES=1`) complete an explicit NULL tile mapping
+  before placement returns, adapting the NVIDIA workaround in #3116. Failed signalling,
+  device removal or a five-second wait deadline fails placement instead of publishing an
+  unfinished texture. Uncertain mapping resources remain held until completion is proven.
 - `XCL_TEXTURE_SYSMEM=1`, together with `XCL_TEXTURE_LEVEL_PAGES=1`, optionally backs newly
   loaded sampled texture levels with system-memory heaps. Existing shared pages keep their
   backing; render targets and other allocations keep the normal placement path. Failed
