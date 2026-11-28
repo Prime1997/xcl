@@ -363,6 +363,8 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
   unfinished texture. Uncertain mapping resources remain held until completion is proven.
 - Deferred resource releases keep their objects held after device removal; the fence's
   removal sentinel does not count as completed GPU work.
+- Sparse tile reuse and heap retirement require valid completed queue fences. Failed retirement
+  signals or device removal keep the resources held instead of treating removal as completion.
 - `XCL_DEFER_PRIVATE_HOME_TILES=1` keeps physical-page home storage used only by CPU/storage
   transfers from acquiring a second sparse GPU copy. Explicit home mappings expose and upload
   the existing bytes before the next submission, even after an earlier write-watch scan.
