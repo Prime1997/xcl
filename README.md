@@ -348,6 +348,10 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
   fills into its GPU views) are applied: a GPU-view page shows the physical page mapped into it.
   `XCL_PAGE_MAPPINGS=0` turns them off (the call is ignored and a GPU-view page shows its CPU view at
   the same offset, as before).
+- Idle spare command lists and XCL-owned alternate command allocators are reclaimed every two
+  seconds, including while loading stops presenting. Live recordings, unfinished submissions,
+  and failed fence signals retain their owners. With `XCL_ACTIVITY`, `command pools` reports
+  remaining and retired object counts; these are not measurements of memory saved.
 - `XCL_MEMORY_OWNERS=1` with `XCL_ACTIVITY` samples known physical-page CPU backing every
   20 seconds. It reports live page IDs, home reservations and committed virtual address space;
   queries run outside mapping locks and stop at 100 ms or 16,384 regions. Concurrent snapshots
