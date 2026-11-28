@@ -549,16 +549,21 @@ mod tests {
             }
             let dev = dev.unwrap();
             let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
-            let cell = Box::new([0u32; 2]);
+            let cell = Box::new([AtomicU32::new(0), AtomicU32::new(0)]);
             let va = cell.as_ptr() as usize;
             assert!(writable(va, 8));
+            // A timeout or unwind must not free memory the worker may still write.
+            let cell = std::mem::ManuallyDrop::new(cell);
             after(q.as_raw(), vec![Write::Immediate(va, vec![7, 9])]);
             let t = std::time::Instant::now();
-            while (*(va as *const AtomicU32)).load(Ordering::Acquire) != 7 {
+            // The last release store follows both destination writes.
+            while cell[1].load(Ordering::Acquire) != 9 {
                 assert!(t.elapsed().as_secs() < 5, "never written");
                 std::thread::yield_now();
             }
-            assert_eq!(*cell, [7, 9]);
+            let actual = [cell[0].load(Ordering::Acquire), cell[1].load(Ordering::Acquire)];
+            drop(std::mem::ManuallyDrop::into_inner(cell));
+            assert_eq!(actual, [7, 9]);
         }
     }
 
