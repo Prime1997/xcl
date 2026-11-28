@@ -1851,6 +1851,19 @@ pub fn physical_page_at(va: usize) -> bool {
     AWAY.lock().unwrap().as_ref().is_some_and(|a| a.at.contains_key(&(va & !(PHYS_PAGE - 1))))
 }
 
+/// Physical identities for GPU-owned targets (#1182/#2177): the title's explicit mappings,
+/// including aliases whose bytes XCL moved elsewhere. Allocation or CPU reads do not map a home.
+/// AWAY::title already records these identities; do not confuse them with the CPU storage place.
+pub fn physical_pages(va: usize, n: usize) -> Vec<Option<usize>> {
+    let g = AWAY.lock().unwrap();
+    let Some(a) = g.as_ref() else { return vec![None; n] };
+    let blocks = PHYS_BLOCKS.lock().unwrap();
+    (0..n).map(|i| {
+        let at = va.checked_add(i.checked_mul(PHYS_PAGE)?)?;
+        a.at.get(&at).or_else(|| a.title.get(&at)).copied().filter(|&p| page_home_in(&blocks, p).is_some())
+    }).collect()
+}
+
 /// Counts the calls that map or unmap physical pages in a GPU view (`mirrors`): what
 /// `physical_page_at` says there may have changed.
 static GPU_VIEW_MAP_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2494,12 +2507,17 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
         }
         // (pages this call moved away and back are home again, not given back)
         away.gone.retain(|&h| h < home || h >= home + n * PHYS_PAGE);
-        for (i, &p) in pages.iter().enumerate() {
-            away.title.insert(home + i * PHYS_PAGE, p);
-        }
         for &p in &pages {
             if let Some(&at) = away.page.get(&p) {
                 unmap_away(away, at, &(home..home + n * PHYS_PAGE));
+            }
+        }
+        for (i, &p) in pages.iter().enumerate() {
+            let at = home + i * PHYS_PAGE;
+            // Another page may still occupy this home. Do not remember a conflicting
+            // identity that would reappear after that occupant moves elsewhere (#2177).
+            if !away.at.contains_key(&at) {
+                away.title.insert(at, p);
             }
         }
         return home as *mut c_void;
@@ -3766,6 +3784,54 @@ mod tests {
             assert_eq!(*(home_b as *const u32), 0xAABB_CCDD);
             assert!(!PHYS_BLOCKS.lock().unwrap().contains_key(&first), "the old home reservation goes once vacated");
             assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, pages.as_mut_ptr().add(1)), 1);
+        }
+    }
+
+    /// The GPU asks which physical pages were explicitly mapped at each address.
+    /// Moving CPU bytes retains console aliases; explicit unmap and free remove their identity.
+    #[test]
+    fn mapped_home_page_identity_follows_moves_and_partial_frees() {
+        unsafe {
+            if crate::gpu::uma::get().is_none() {
+                return crate::gpu::recomp::runner::skip_test("no UMA");
+            }
+            let mut count = 2;
+            let mut pages = [0usize; 2];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut count, pages.as_mut_ptr()), 1);
+            let home = page_home(pages[0]).unwrap();
+            assert_eq!(physical_pages(home, 2), vec![None, None], "allocation alone does not map its home");
+            assert_eq!(MapTitlePhysicalPages(std::ptr::null_mut(), 2, 0, 4, pages.as_mut_ptr()) as usize, home);
+            assert_eq!(physical_pages(home, 2), vec![Some(pages[0]), Some(pages[1])]);
+            let elsewhere = mem::VirtualAlloc(std::ptr::null(), PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE);
+            assert!(!elsewhere.is_null());
+            assert_eq!(MapTitlePhysicalPages(elsewhere, 1, 0, 4, pages.as_mut_ptr()), elsewhere);
+            assert_eq!(physical_pages(home, 2), vec![Some(pages[0]), Some(pages[1])]);
+            assert_eq!(physical_pages(elsewhere as usize, 1), vec![Some(pages[0])]);
+            let mut nonconsecutive = [pages[1], pages[0]];
+            assert!(MapTitlePhysicalPages(std::ptr::null_mut(), 2, 0, 4, nonconsecutive.as_mut_ptr()).is_null());
+            assert_eq!(physical_pages(elsewhere as usize, 1), vec![Some(pages[0])]);
+            assert_eq!(physical_pages(home, 2), vec![Some(pages[0]), Some(pages[1])]);
+            assert_eq!(MapTitlePhysicalPages(home as *mut c_void, 1, 0, 4, pages.as_mut_ptr()) as usize, home);
+            assert_eq!(physical_pages(elsewhere as usize, 1), vec![Some(pages[0])], "the console alias remains after CPU storage moves home");
+            assert_eq!(physical_pages(home, 2), vec![Some(pages[0]), Some(pages[1])]);
+            // Page 1 goes over page 0's former home and then moves onward.
+            let first = home as *mut c_void;
+            assert_eq!(MapTitlePhysicalPages(first, 1, 0, 4, pages.as_mut_ptr().add(1)), first);
+            assert_eq!(physical_pages(home, 2), vec![Some(pages[1]), Some(pages[1])]);
+            // Requesting the first page at home while the second still occupies it does
+            // not evict that occupant in kernelx. Do not cache a conflicting GPU identity.
+            assert_eq!(MapTitlePhysicalPages(first, 1, 0, 4, pages.as_mut_ptr()), first);
+            assert_eq!(physical_pages(home, 2), vec![Some(pages[1]), Some(pages[1])]);
+            assert_eq!(MapTitlePhysicalPages(elsewhere, 1, 0, 4, pages.as_mut_ptr().add(1)), elsewhere);
+            assert_eq!(physical_pages(home, 2), vec![Some(pages[1]), Some(pages[1])], "both explicit aliases still name B");
+            assert_eq!(MapTitlePhysicalPages(std::ptr::null_mut(), 2, 0, 4, pages.as_mut_ptr()) as usize, home);
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, pages.as_mut_ptr()), 1);
+            assert_eq!(physical_pages(home, 2), vec![None, Some(pages[1])]);
+            let second = (home + PHYS_PAGE) as *mut c_void;
+            assert_eq!(MapTitlePhysicalPages(second, 1, 0, 4, std::ptr::null_mut()), second);
+            assert_eq!(physical_pages(home, 2), vec![None, None]);
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, pages.as_mut_ptr().add(1)), 1);
+            assert_ne!(mem::VirtualFree(elsewhere, 0, mem::MEM_RELEASE), 0);
         }
     }
 
