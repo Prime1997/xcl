@@ -32,6 +32,7 @@ mod indirect_guard;
 mod late_release;
 pub mod layout;
 pub mod list_x;
+pub mod memory_report;
 mod look_stats;
 mod lut3d;
 pub mod null;

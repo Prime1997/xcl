@@ -182,6 +182,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 tick += 1;
                 if tick % 10 == 0 {
                     crate::xlog_info!("{}", crate::hle::d3d12x::title_textures::upload_line());
+                    crate::xlog_info!("{}", crate::hle::d3d12x::memory_report::line(private as u64));
                 }
                 // past the budget Windows moves the process's video memory off the card and
                 // every frame pays for bringing it back; a run at the card's limit is also

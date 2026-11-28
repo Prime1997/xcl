@@ -456,6 +456,14 @@ pub fn counts() -> (usize, u64) {
     (TEXTURES.lock().unwrap().by_res.len(), UPLOADS.load(Ordering::Relaxed))
 }
 
+/// Registered non-placed texture count and console payload size (#2697). The host allocation
+/// can differ; this is neither a PC heap size nor a count of all committed resources.
+pub(super) fn committed_texture_bytes() -> (usize, u64) {
+    let t = TEXTURES.lock().unwrap();
+    t.by_res.values().chain(t.shadowed.values()).filter(|e| !e.placed)
+        .fold((0, 0), |(n, bytes), e| (n + 1, bytes + e.tex.size()))
+}
+
 /// Whether a non-depth render target / UAV texture is small enough to be a CPU-filled glyph or UI
 /// atlas (`<= 1M` pixels, up to `2048` on either axis, e.g. a retail title's `2048x128` R8 glyph cache).
 fn is_small_cpu_filled_target(w: u64, h: u32, samples: u32, flags: u32) -> bool {
@@ -2129,6 +2137,13 @@ struct QueueUploads {
 unsafe impl Send for QueueUploads {}
 
 static ON_QUEUE: Mutex<BTreeMap<usize, QueueUploads>> = Mutex::new(BTreeMap::new());
+
+/// Upload buffer capacities visible in the existing idle and submitted queues.
+/// A job still being prepared is outside these counters.
+pub(super) fn upload_bytes() -> (u64, u64) {
+    let submitted = ON_QUEUE.lock().unwrap().values().map(|q| q.bytes).sum();
+    (texture_upload::idle_bytes(), submitted)
+}
 
 /// The memory line of the texture upload buffers (`XCL_ACTIVITY`): system memory the process holds
 /// for them, idle, and submitted but not yet taken back (`reclaim`: done on the GPU or not).

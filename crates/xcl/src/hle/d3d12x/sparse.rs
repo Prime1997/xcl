@@ -1200,6 +1200,20 @@ pub fn pool_bytes() -> (usize, usize) {
     let quarantined: usize = s.quarantined.iter().map(|b| b.tiles.len()).sum();
     (pools, pools.saturating_sub((s.free.len() + s.cooling.len() + quarantined) * TILE))
 }
+
+/// Tracked CPU backing, allocated upload-hash payloads, and retired DEFAULT heaps (#2697).
+/// A GPU-view entry has no CPU allocation of its own; counting it would count aliases twice.
+/// Hash-table capacity, allocator overhead, readbacks and CPU memory outside these windows
+/// are not included. This only reads metadata; it never touches the title's pages.
+pub(super) fn memory_backing_bytes() -> (usize, usize, usize) {
+    let g = lock_state();
+    let _held = holding(Holder::Other);
+    let Some(s) = g.as_ref() else { return (0, 0, 0) };
+    let cpu = s.mapped.values().filter(|e| e.src == 0)
+        .map(|e| (PAGES_PER_TILE - e.holes.count_ones() as usize) * PAGE).sum();
+    let hashes = s.mapped.values().map(|e| e.sent.iter().filter(|p| p.is_some()).count() * std::mem::size_of::<[u64; CHUNKS]>()).sum();
+    (cpu, hashes, s.retired.len() * POOL_TILES as usize * TILE)
+}
 /// commits before the device existed: the pages committed, as disjoint page ranges (start →
 /// end) merged with their neighbours, so a commit or decommit costs O(log n) and not a scan of
 /// every page committed so far. Like `committed` / `decommitted` with a state, a range counts

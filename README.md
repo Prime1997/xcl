@@ -390,7 +390,10 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
   - `XCL_ACTIVITY=1` (any value turns it on): every 2 seconds `xcl.log` gets an `activity (2 s)`
     line with what the title did in that time (presents, submits, draws, dispatches, frame-event
     waits, DirectStorage requests), and a `memory:` line with the process's commit and the video
-    memory in use. Where the lines stop changing is where the title stopped.
+    memory in use. Every 20 seconds, `memory owners` also separates tracked CPU backing,
+    local/system texture pools, sparse pools, uploads and both adapter budgets. These capacities
+    overlap with process and GPU totals; driver/PSO and untracked allocations remain unattributed.
+    Where the lines stop changing is where the title stopped.
   - `XCL_THREAD_DUMP_AT=s1,s2,…`: at each of those seconds after the start, the state of every
     thread of the title goes into `xcl.log`, for a title that stalls.
   - `XCL_TRACE_FAULTS=1` (any value): the first 32 access violations are logged as they are raised
