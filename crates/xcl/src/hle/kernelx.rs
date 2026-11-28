@@ -1773,8 +1773,38 @@ pub mod pagelog {
 /// Size of one console physical page (64 KiB).
 pub const PHYS_PAGE_SIZE: usize = PHYS_PAGE;
 
-/// first page index → (pages in the block, pages still allocated, the block's home)
-static PHYS_BLOCKS: std::sync::Mutex<std::collections::BTreeMap<usize, (usize, usize, usize)>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+// Per-page liveness follows upstream #608; partial backing release follows #2004.
+struct PhysicalBlock {
+    count: usize,
+    live: usize,
+    home: usize,
+    freed: Vec<usize>,
+}
+
+impl PhysicalBlock {
+    const WORD_BITS: usize = usize::BITS as usize;
+
+    fn new(count: usize, home: usize) -> Self {
+        Self { count, live: count, home, freed: vec![0; count.div_ceil(Self::WORD_BITS)] }
+    }
+
+    fn is_live(&self, offset: usize) -> bool {
+        offset < self.count && self.freed[offset / Self::WORD_BITS] & (1 << (offset % Self::WORD_BITS)) == 0
+    }
+
+    fn free_page(&mut self, offset: usize) -> bool {
+        if !self.is_live(offset) {
+            return false;
+        }
+        self.freed[offset / Self::WORD_BITS] |= 1 << (offset % Self::WORD_BITS);
+        self.live -= 1;
+        true
+    }
+}
+
+/// first page index → its physical page allocation
+type PhysicalBlocks = std::collections::BTreeMap<usize, PhysicalBlock>;
+static PHYS_BLOCKS: std::sync::Mutex<PhysicalBlocks> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// the next page index handed out (page numbers are not addresses: a block's home is in a
 /// sparse window, the coherent one, or – without room there – plain reserved memory)
@@ -1885,12 +1915,17 @@ fn page_index(page: usize) -> Option<usize> {
     page.is_multiple_of(FRAMES).then(|| (page / FRAMES).checked_sub(1)).flatten()
 }
 
-/// The home address of page `page` if it belongs to a live allocation.
+/// The home address of page `page` if that specific page is still allocated.
 fn page_home(page: usize) -> Option<usize> {
-    let index = page_index(page)?;
     let blocks = PHYS_BLOCKS.lock().ok()?;
-    let (&first, &(count, live, home)) = blocks.range(..=index).next_back()?;
-    (live > 0 && index < first.checked_add(count)?).then(|| home.checked_add((index - first).checked_mul(PHYS_PAGE)?)).flatten()
+    page_home_in(&blocks, page)
+}
+
+fn page_home_in(blocks: &PhysicalBlocks, page: usize) -> Option<usize> {
+    let index = page_index(page)?;
+    let (&first, block) = blocks.range(..=index).next_back()?;
+    let offset = index - first;
+    block.is_live(offset).then(|| block.home.checked_add(offset.checked_mul(PHYS_PAGE)?)).flatten()
 }
 
 /// Whether every page of `pages` (at least one) is a physical page allocated now.
@@ -2028,6 +2063,12 @@ unsafe fn move_home_away(away: &mut Away, home: usize) -> bool {
 /// The homes `move_home_away` collected, decommitted in runs of neighbouring pages.
 unsafe fn give_back_homes(away: &mut Away) {
     let mut homes = std::mem::take(&mut away.gone);
+    decommit_home_runs(&mut homes);
+    release_empty_physical_blocks(Some(away));
+}
+
+/// Only unused lazy homes, with AWAY held until the runs have been decommitted.
+unsafe fn decommit_home_runs(homes: &mut Vec<usize>) {
     homes.sort_unstable();
     homes.dedup();
     let mut i = 0;
@@ -2334,58 +2375,81 @@ pub unsafe extern "system" fn AllocateTitlePhysicalPages(_p: HANDLE, _t: u32, nu
     for i in 0..n {
         *arr.add(i) = page_number(first + i);
     }
-    PHYS_BLOCKS.lock().unwrap().insert(first, (n, n, block));
+    PHYS_BLOCKS.lock().unwrap().insert(first, PhysicalBlock::new(n, block));
     1
 }
 
 pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: *mut usize) -> BOOL {
-    let Some(u) = crate::gpu::uma::get() else { return 0 };
+    if crate::gpu::uma::get().is_none() { return 0; }
     if arr.is_null() {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return 0;
     }
-    // freed pages mapped elsewhere: that address keeps whatever it holds, the mapping goes
-    if let Some(away) = AWAY.lock().unwrap().as_mut() {
-        for i in 0..n {
-            if let Some(at) = away.page.remove(&*arr.add(i)) {
-                away.at.remove(&at);
-                note_mapping_at(at);
-                pagelog::note("page freed while mapped (the address keeps its bytes)", at, 0, *arr.add(i));
-            }
-            // (those at home too: their home goes with the block)
-            crate::hle::d3d12x::sparse::remapped(&mirrors::page_freed(*arr.add(i)));
-        }
-        // (page numbers are never handed out again: their entries go)
-        if !away.title.is_empty() {
-            let freed: std::collections::HashSet<usize> = (0..n).map(|i| *arr.add(i)).collect();
-            away.title.retain(|_, p| !freed.contains(p));
-        }
-    }
-    let mut g = PHYS_BLOCKS.lock().unwrap();
+    // Keep the map/read lock until all decommits finish: another mapping must not reuse a
+    // freed home between the metadata update and its delayed decommit.
+    let mut mappings = AWAY.lock().unwrap();
+    let mut blocks = PHYS_BLOCKS.lock().unwrap();
+    let mut freed = Vec::new();
     for i in 0..n {
-        let Some(page) = page_index(*arr.add(i)) else { continue };
-        // the block holding this page
-        let Some((&first, &(count, _, home))) = g.range(..=page).next_back() else { continue };
-        if page >= first + count {
+        let page = *arr.add(i);
+        let Some(index) = page_index(page) else { continue };
+        let Some((&first, block)) = blocks.range_mut(..=index).next_back() else { continue };
+        let offset = index - first;
+        if !block.free_page(offset) {
             continue;
         }
-        let e = g.get_mut(&first).unwrap();
-        e.1 = e.1.saturating_sub(1);
-        if e.1 == 0 {
-            g.remove(&first);
-            // (a tile may show a page kept in the block: `source_part`)
-            source_going(home, count * PHYS_PAGE, true, || {
-                if u.is_sparse(home) {
-                    crate::hle::d3d12x::sparse::free(home);
-                } else if u.contains(home) {
-                    u.free(home);
-                } else {
-                    mem::VirtualFree(home as *mut c_void, 0, mem::MEM_RELEASE);
-                }
-            });
+        freed.push((page, block.home + offset * PHYS_PAGE));
+    }
+    drop(blocks);
+    let mut partial_homes = Vec::new();
+    for &(page, home) in &freed {
+        if let Some(away) = mappings.as_mut() {
+            if let Some(at) = away.page.remove(&page) {
+                away.at.remove(&at);
+                // #1221: a released lazy mapping must not recommit on a later fault.
+                lazy::unmark(at);
+                note_mapping_at(at);
+                pagelog::note("page freed while mapped (the address keeps its bytes)", at, 0, page);
+            }
+        }
+        crate::hle::d3d12x::sparse::remapped(&mirrors::page_freed(page));
+        // The home can hold another live physical page. Its bytes belong to that occupant.
+        if lazy_home(home) && mappings.as_ref().is_none_or(|a| !a.at.contains_key(&home)) {
+            partial_homes.push(home);
         }
     }
+    if let Some(away) = mappings.as_mut().filter(|a| !a.title.is_empty()) {
+        let ids: std::collections::HashSet<usize> = freed.iter().map(|&(p, _)| p).collect();
+        away.title.retain(|_, p| !ids.contains(p));
+    }
+    // Before releasing any whole block: no address can have been handed out again yet.
+    decommit_home_runs(&mut partial_homes);
+    release_empty_physical_blocks(mappings.as_ref());
     1
+}
+
+/// AWAY stays locked: an empty allocation may still be the address of another block's page.
+/// Keep its reservation until that occupant moves or is freed, then release it before reuse.
+unsafe fn release_empty_physical_blocks(away: Option<&Away>) {
+    let Some(u) = crate::gpu::uma::get() else { return };
+    let mut blocks = PHYS_BLOCKS.lock().unwrap();
+    let empty: Vec<usize> = blocks.iter().filter_map(|(&first, b)| {
+        (b.live == 0 && away.is_none_or(|a| a.at.range(b.home..b.home + b.count * PHYS_PAGE).next().is_none())).then_some(first)
+    }).collect();
+    let released: Vec<_> = empty.into_iter().filter_map(|first| blocks.remove(&first)).collect();
+    drop(blocks);
+    for block in released {
+        let (home, count) = (block.home, block.count);
+        source_going(home, count * PHYS_PAGE, true, || {
+            if u.is_sparse(home) {
+                crate::hle::d3d12x::sparse::free(home);
+            } else if u.contains(home) {
+                u.free(home);
+            } else {
+                mem::VirtualFree(home as *mut c_void, 0, mem::MEM_RELEASE);
+            }
+        });
+    }
 }
 
 pub unsafe extern "system" fn MapTitlePhysicalPages(va: *mut c_void, n: usize, _t: u32, _p: u32, arr: *mut usize) -> *mut c_void {
@@ -3603,6 +3667,105 @@ mod tests {
                 assert!(info.0[52..64].iter().all(|&b| b == 0));
                 assert_eq!(u.sparse_release(s), Some(len));
             }
+        }
+    }
+
+    #[test]
+    fn physical_page_liveness_crosses_bitmap_words() {
+        let boundary = PhysicalBlock::WORD_BITS;
+        let mut block = PhysicalBlock::new(boundary + 1, 0);
+        assert!(block.free_page(boundary - 1));
+        assert!(block.is_live(boundary));
+        assert!(block.free_page(boundary));
+        assert!(!block.free_page(boundary));
+        assert!(!block.is_live(boundary - 1));
+        assert!(!block.free_page(boundary + 1));
+        assert!(block.is_live(0));
+        assert_eq!(block.live, boundary - 1);
+    }
+
+    /// Plain Windows backing keeps this fixture out of sparse GPU allocation paths.
+    #[test]
+    fn partial_physical_free_reclaims_home_and_preserves_live_siblings() {
+        unsafe {
+            if crate::gpu::uma::get().is_none() {
+                return crate::gpu::recomp::runner::skip_test("no UMA");
+            }
+            let home = mem::VirtualAlloc(std::ptr::null(), 3 * PHYS_PAGE, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE) as usize;
+            assert_ne!(home, 0);
+            let first = NEXT_PAGE_INDEX.fetch_add(3, Ordering::Relaxed);
+            PHYS_BLOCKS.lock().unwrap().insert(first, PhysicalBlock::new(3, home));
+            let mut pages = [page_number(first), page_number(first + 1), page_number(first + 2)];
+            *((home + 2 * PHYS_PAGE) as *mut u32) = 0x1234_5678;
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, pages.as_mut_ptr().add(1)), 1);
+            assert!(!committed_page(home + PHYS_PAGE), "a freed home is decommitted before its siblings go");
+            assert!(page_home(pages[1]).is_none(), "a freed ID cannot be resolved again");
+            assert!(physical_pages_live(&[pages[0], pages[2]]));
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, pages.as_mut_ptr().add(1)), 1);
+            assert!(physical_pages_live(&[pages[0], pages[2]]), "repeated free does not retire a sibling");
+            assert_eq!(*((home + 2 * PHYS_PAGE) as *const u32), 0x1234_5678);
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 3, pages.as_mut_ptr()), 1);
+            assert!(pages.iter().all(|&p| page_home(p).is_none()));
+        }
+    }
+
+    #[test]
+    fn partial_physical_free_does_not_decommit_another_pages_mapping() {
+        unsafe {
+            if crate::gpu::uma::get().is_none() {
+                return crate::gpu::recomp::runner::skip_test("no UMA");
+            }
+            let home = mem::VirtualAlloc(std::ptr::null(), 2 * PHYS_PAGE, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE) as usize;
+            assert_ne!(home, 0);
+            let first = NEXT_PAGE_INDEX.fetch_add(2, Ordering::Relaxed);
+            PHYS_BLOCKS.lock().unwrap().insert(first, PhysicalBlock::new(2, home));
+            let mut pages = [page_number(first), page_number(first + 1)];
+            {
+                let mut g = AWAY.lock().unwrap();
+                let a = g.get_or_insert_with(Away::default);
+                a.at.insert(home, pages[1]);
+                a.page.insert(pages[1], home);
+            }
+            *(home as *mut u32) = 0x5678_ABCD;
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, pages.as_mut_ptr()), 1);
+            assert!(committed_page(home), "the home now holds a live sibling's bytes");
+            assert_eq!(*(home as *const u32), 0x5678_ABCD);
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, pages.as_mut_ptr().add(1)), 1);
+        }
+    }
+
+    #[test]
+    fn an_empty_physical_block_keeps_a_foreign_occupant_until_it_moves() {
+        unsafe {
+            if crate::gpu::uma::get().is_none() {
+                return crate::gpu::recomp::runner::skip_test("no UMA");
+            }
+            let alloc = || mem::VirtualAlloc(std::ptr::null(), PHYS_PAGE, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE) as usize;
+            let (home_a, home_b) = (alloc(), alloc());
+            assert_ne!(home_a, 0);
+            assert_ne!(home_b, 0);
+            let first = NEXT_PAGE_INDEX.fetch_add(2, Ordering::Relaxed);
+            let mut pages = [page_number(first), page_number(first + 1)];
+            {
+                let mut blocks = PHYS_BLOCKS.lock().unwrap();
+                blocks.insert(first, PhysicalBlock::new(1, home_a));
+                blocks.insert(first + 1, PhysicalBlock::new(1, home_b));
+            }
+            {
+                let mut g = AWAY.lock().unwrap();
+                let a = g.get_or_insert_with(Away::default);
+                a.at.insert(home_a, pages[1]);
+                a.page.insert(pages[1], home_a);
+            }
+            *(home_a as *mut u32) = 0xAABB_CCDD;
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, pages.as_mut_ptr()), 1);
+            assert!(page_home(pages[0]).is_none());
+            assert!(committed_page(home_a), "another allocation still owns the bytes here");
+            assert_eq!(*(home_a as *const u32), 0xAABB_CCDD);
+            assert_eq!(MapTitlePhysicalPages(home_b as *mut c_void, 1, 0, 4, pages.as_mut_ptr().add(1)) as usize, home_b);
+            assert_eq!(*(home_b as *const u32), 0xAABB_CCDD);
+            assert!(!PHYS_BLOCKS.lock().unwrap().contains_key(&first), "the old home reservation goes once vacated");
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, pages.as_mut_ptr().add(1)), 1);
         }
     }
 

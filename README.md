@@ -348,6 +348,7 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
   fills into its GPU views) are applied: a GPU-view page shows the physical page mapped into it.
   `XCL_PAGE_MAPPINGS=0` turns them off (the call is ignored and a GPU-view page shows its CPU view at
   the same offset, as before).
+- Releasing physical pages returns unused per-page home backing immediately; live sibling pages remain allocated, including after repeated frees.
 - `XCL_TEXTURE_SYSMEM=1`, together with `XCL_TEXTURE_LEVEL_PAGES=1`, optionally backs newly
   loaded sampled texture levels with system-memory heaps. Existing shared pages keep their
   backing; render targets and other allocations keep the normal placement path. Failed
