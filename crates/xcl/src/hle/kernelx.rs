@@ -2435,6 +2435,12 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
         let ids: std::collections::HashSet<usize> = freed.iter().map(|&(p, _)| p).collect();
         away.title.retain(|_, p| !ids.contains(p));
     }
+    // A whole block uses its existing release notification while its bytes still exist.
+    // Only blocks retained for siblings/foreign mappings need the separate partial decommit.
+    let whole: Vec<(usize, usize)> = PHYS_BLOCKS.lock().unwrap().values().filter(|b| {
+        b.live == 0 && mappings.as_ref().is_none_or(|a| a.at.range(b.home..b.home + b.count * PHYS_PAGE).next().is_none())
+    }).map(|b| (b.home, b.home + b.count * PHYS_PAGE)).collect();
+    partial_homes.retain(|h| !whole.iter().any(|&(lo, hi)| (lo..hi).contains(h)));
     // Before releasing any whole block: no address can have been handed out again yet.
     decommit_home_runs(&mut partial_homes);
     release_empty_physical_blocks(mappings.as_ref());
