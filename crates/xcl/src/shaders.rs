@@ -1353,8 +1353,8 @@ mod pipeline_cap_tests {
             &[],
         )
         .expect("piece1 DXC compile");
-        // Larger than both pieces so a cap between piece size and whole size proves each piece
-        // is capped individually rather than against the unsplit whole container.
+        // A distinct whole form exercises its own cache entry and cold-build cap. Its DXIL
+        // size relative to either piece depends on the compiler version.
         let whole = recomp::dxc::compile(
             "RWByteAddressBuffer mem : register(u2); \
              [numthreads(1,1,1)] void main() { \
@@ -1426,16 +1426,28 @@ mod pipeline_cap_tests {
         // Valid cached blobs stay reusable even when they exceed the cold-build cap.
         assert_eq!(pipelines.reused.load(Ordering::Relaxed), reused_before + 2);
 
-        // A missing whole form obeys the cap too; the two pieces remain independently usable.
-        assert!(whole.len() > max_piece, "fixture whole form must exceed its pieces");
+        // Restore the rejected piece before testing a cold whole with both pieces cached.
+        pipelines.max_dxil = max_piece.max(whole.len());
+        let reused_before = pipelines.reused.load(Ordering::Relaxed);
+        let made_before = pipelines.made.load(Ordering::Relaxed);
+        pipelines.make(&compiled);
+        assert!(p0_path.is_file() && p0_path.metadata().unwrap().len() > 0, "piece 0 .chain.pso missing");
+        assert!(p1_path.is_file() && p1_path.metadata().unwrap().len() > 0, "restored piece 1 .chain.pso missing");
+        assert_eq!(pipelines.reused.load(Ordering::Relaxed), reused_before + 2);
+        assert_eq!(pipelines.made.load(Ordering::Relaxed), made_before + 3);
+        assert_eq!(pipelines.refused.load(Ordering::Relaxed), 0);
+
+        // A missing whole form obeys its cap regardless of how large the cached pieces are.
         std::fs::remove_file(&whole_chain_path).unwrap();
-        pipelines.max_dxil = max_piece;
+        pipelines.max_dxil = whole.len() - 1;
         let capped_before = pipelines.capped.load(Ordering::Relaxed);
         let made_before = pipelines.made.load(Ordering::Relaxed);
+        let reused_before = pipelines.reused.load(Ordering::Relaxed);
         pipelines.make(&compiled);
         assert!(!whole_chain_path.exists(), "over-cap cold whole form must not be built");
         assert_eq!(pipelines.capped.load(Ordering::Relaxed), capped_before + 1);
         assert_eq!(pipelines.made.load(Ordering::Relaxed), made_before + 2);
+        assert_eq!(pipelines.reused.load(Ordering::Relaxed), reused_before + 2);
     }
 }
 
