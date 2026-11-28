@@ -9689,14 +9689,18 @@ pub fn log_device_removed() {
         crate::xlog_error!("system commit at the removal: {} of {} MB ({} MB left)", commit >> 20, limit >> 20, limit.saturating_sub(commit) >> 20);
     }
     unsafe {
-        // (DRED 1.2: 3 hung, 6 fault, 7 page fault; 0 when the removal did not come from work
-        // the GPU was doing – then there is no page fault and there are no breadcrumbs either)
+        // DRED 1.2: 0 unknown, 3 hung, 6 fault, 7 page fault. Unknown does not rule out
+        // GPU work or a page fault; diagnostic collection may be unavailable.
         match dev.cast::<ID3D12DeviceRemovedExtendedData2>() {
-            Ok(d) => crate::xlog_error!("DRED device state: {}", d.GetDeviceState().0),
+            Ok(d) => {
+                let state = d.GetDeviceState();
+                crate::xlog_error!("DRED device state: {}{}", state.0, if state == D3D12_DRED_DEVICE_STATE_UNKNOWN { " (unknown)" } else { "" });
+            }
             Err(e) => crate::xlog_error!("DRED device state: not available ({:#x})", e.code().0 as u32),
         }
         let Ok(dred) = dev.cast::<ID3D12DeviceRemovedExtendedData>() else { return };
-        if let Ok(pf) = dred.GetPageFaultAllocationOutput() {
+        let page_fault = dred.GetPageFaultAllocationOutput();
+        if let Ok(pf) = &page_fault {
             let names = |mut n: *const D3D12_DRED_ALLOCATION_NODE| {
                 let mut v = Vec::new();
                 while !n.is_null() && v.len() < 8 {
@@ -9710,11 +9714,13 @@ pub fn log_device_removed() {
             let va = pf.PageFaultVA;
             let window = uma_window_vas().iter().position(|&w| va >= w && va < w + 0x1_0000_0000).map(|k| format!(" = window {k} + {:#x}", va - uma_window_vas()[k])).unwrap_or_default();
             crate::xlog_error!("DRED page fault at GPU VA {va:#x}{window}; allocations there: [{}]; recently freed: [{}]", names(pf.pHeadExistingAllocationNode), names(pf.pHeadRecentFreedAllocationNode));
+        } else if let Err(e) = &page_fault {
+            crate::xlog_error!("DRED page-fault output unavailable ({:#x})", e.code().0 as u32);
         }
         let breadcrumbs = dred.GetAutoBreadcrumbsOutput();
         match &breadcrumbs {
             Err(e) => crate::xlog_error!("DRED: no breadcrumbs ({:#x})", e.code().0 as u32),
-            Ok(bc) if bc.pHeadAutoBreadcrumbNode.is_null() => crate::xlog_error!("DRED: no breadcrumbs (no list was in flight)"),
+            Ok(bc) if bc.pHeadAutoBreadcrumbNode.is_null() => crate::xlog_error!("DRED: no breadcrumbs (empty output)"),
             Ok(_) => {}
         }
         if let Ok(bc) = breadcrumbs {
