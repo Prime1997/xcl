@@ -6966,6 +6966,17 @@ unsafe fn note_pipeline_for_dump(this: *mut c_void, desc: *const c_void, ppv: *m
     super::capture::note_graphics(*ppv as usize, d, &stages, graphics_wave32(this));
 }
 
+#[cfg(test)]
+thread_local! {
+    // Observe synchronous native-DXIL fixture calls without counting other tests' pipelines.
+    static GRAPHICS_FALLBACK_ATTEMPTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn graphics_fallback_attempts_for_test() -> u64 {
+    GRAPHICS_FALLBACK_ATTEMPTS.with(|n| n.get())
+}
+
 /// `dev_create_graphics_pso`; `stream`: the desc is a pipeline stream's (`stream_pipeline`).
 unsafe fn graphics_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void, stream: bool) -> HRESULT {
     super::null::capture_graphics_desc(desc as *const u8);
@@ -6986,6 +6997,8 @@ unsafe fn graphics_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID
     if hr >= 0 || !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
         return hr;
     }
+    #[cfg(test)]
+    GRAPHICS_FALLBACK_ATTEMPTS.with(|n| n.set(n.get() + 1));
     let d = dummy();
     let mut copy: D3D12_GRAPHICS_PIPELINE_STATE_DESC = std::ptr::read(desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC);
     copy.VS = bytecode(&d.vs);
