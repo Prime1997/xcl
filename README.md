@@ -359,6 +359,13 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
   unfinished texture. Uncertain mapping resources remain held until completion is proven.
 - Deferred resource releases keep their objects held after device removal; the fence's
   removal sentinel does not count as completed GPU work.
+- `XCL_DEFER_PRIVATE_HOME_TILES=1` keeps physical-page home storage used only by CPU/storage
+  transfers from acquiring a second sparse GPU copy. Explicit home mappings expose and upload
+  the existing bytes before the next submission, even after an earlier write-watch scan.
+  Already-exposed homes keep their normal behavior. Off by default; this reduces avoidable
+  backing, not the memory needed by live GPU mappings, and is not a VRAM budget cap.
+  `XCL_MEMORY_OWNERS=1` reports sampled committed CPU backing in still-private homes separately;
+  that figure is not a measured VRAM saving.
 - `XCL_TEXTURE_SYSMEM=1`, together with `XCL_TEXTURE_LEVEL_PAGES=1`, optionally backs newly
   loaded sampled texture levels with system-memory heaps. Existing shared pages keep their
   backing; render targets and other allocations keep the normal placement path. Failed
